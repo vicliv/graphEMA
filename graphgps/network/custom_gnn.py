@@ -9,6 +9,8 @@ from graphgps.layer.gatedgcn_layer import GatedGCNLayer
 from graphgps.layer.gine_conv_layer import GINEConvLayer
 from graphgps.layer.gcnii_conv_layer import GCN2ConvLayer
 from graphgps.layer.mlp_layer import MLPLayer
+from graphgps.layer.graph_ema_layer import GraphEMALayer
+
 
 class CustomGNN(torch.nn.Module):
     """
@@ -51,6 +53,8 @@ class CustomGNN(torch.nn.Module):
             return GCN2ConvLayer
         elif model_type == 'mlp':
             return MLPLayer
+        elif model_type == 'graphema':
+            return GraphEMALayer
         else:
             raise ValueError("Model {} unavailable".format(model_type))
 
