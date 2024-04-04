@@ -13,6 +13,7 @@ from torch_geometric.graphgym.register import register_train
 
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
+from graphgps.layer.graph_ema_layer import make_bidirectional
 
 
 def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation):
@@ -20,6 +21,8 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     optimizer.zero_grad()
     time_start = time.time()
     for iter, batch in enumerate(loader):
+        if cfg.gnn.layer_type == 'graphema':
+            batch.edge_index = make_bidirectional(batch.edge_index)
         batch.split = 'train'
         batch.to(torch.device(cfg.device))
         pred, true = model(batch)
@@ -32,16 +35,22 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
         loss.backward()
+        
         # Parameters update after accumulating gradients for given num. batches.
         if ((iter + 1) % batch_accumulation == 0) or (iter + 1 == len(loader)):
             if cfg.optim.clip_grad_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
+            if cfg.gnn.layer_type == 'graphema':
+                with torch.no_grad():
+                    for layer in model.gnn_layers:
+                        layer.lmbda.data.clamp_(0.1, 0.9999)
+                        #print(layer.lmbda)
         logger.update_stats(true=_true,
                             pred=_pred,
                             loss=loss.detach().cpu().item(),
-                            lr=scheduler.get_last_lr()[0],
+                            lr=optimizer.param_groups[0]['lr'],
                             time_used=time.time() - time_start,
                             params=cfg.params,
                             dataset_name=cfg.dataset.name)
@@ -53,6 +62,8 @@ def eval_epoch(logger, loader, model, split='val'):
     model.eval()
     time_start = time.time()
     for batch in loader:
+        if cfg.gnn.layer_type == 'graphema':
+            batch.edge_index = make_bidirectional(batch.edge_index)
         batch.split = split
         batch.to(torch.device(cfg.device))
         if cfg.gnn.head == 'inductive_edge':
@@ -107,10 +118,12 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
             wandb_name = make_wandb_name(cfg)
         else:
             wandb_name = cfg.wandb.name
+        print(cfg.wandb.entity)
+        print(wandb_name)
         run = wandb.init(entity=cfg.wandb.entity, project=cfg.wandb.project,
                          name=wandb_name)
         run.config.update(cfg_to_dict(cfg))
-
+    #torch.autograd.set_detect_anomaly(True)
     num_splits = len(loggers)
     split_names = ['val', 'test']
     full_epoch_times = []
@@ -120,7 +133,12 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
         train_epoch(loggers[0], loaders[0], model, optimizer, scheduler,
                     cfg.optim.batch_accumulation)
         perf[0].append(loggers[0].write_epoch(cur_epoch))
-
+        
+        if cfg.gnn.layer_type == 'graphema':
+            with torch.no_grad():
+                for layer in model.gnn_layers:
+                    print(layer.lmbda.item(), end="\t")
+                print("")
         if is_eval_epoch(cur_epoch):
             for i in range(1, num_splits):
                 eval_epoch(loggers[i], loaders[i], model,

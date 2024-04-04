@@ -35,7 +35,15 @@ class CustomGNN(torch.nn.Module):
         self.model_type = cfg.gnn.layer_type
         layers = []
         for _ in range(cfg.gnn.layers_mp):
-            layers.append(conv_model(dim_in,
+            if cfg.gnn.layer_type == 'graphema':
+                layers.append(conv_model(dim_in,
+                                     dim_in,
+                                     dropout=cfg.gnn.dropout,
+                                     residual=cfg.gnn.residual,
+                                     lmbda=cfg.gnn.lmbda,
+                                     T=cfg.gnn.T))
+            else:
+                layers.append(conv_model(dim_in,
                                      dim_in,
                                      dropout=cfg.gnn.dropout,
                                      residual=cfg.gnn.residual))
