@@ -42,11 +42,10 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
-            if cfg.gnn.layer_type == 'graphema':
-                with torch.no_grad():
-                    for layer in model.gnn_layers:
-                        layer.lmbda.data.clamp_(0.1, 0.9999)
-                        #print(layer.lmbda)
+            # if cfg.gnn.layer_type == 'graphema':
+            #     with torch.no_grad():
+            #         for layer in model.gnn_layers:
+            #             layer.lmbda.data.clamp_(0.1, 0.9999)
         logger.update_stats(true=_true,
                             pred=_pred,
                             loss=loss.detach().cpu().item(),
@@ -134,11 +133,11 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                     cfg.optim.batch_accumulation)
         perf[0].append(loggers[0].write_epoch(cur_epoch))
         
-        if cfg.gnn.layer_type == 'graphema':
-            with torch.no_grad():
-                for layer in model.gnn_layers:
-                    print(layer.lmbda.item(), end="\t")
-                print("")
+        # if cfg.gnn.layer_type == 'graphema':
+        #     with torch.no_grad():
+        #         for layer in model.gnn_layers:
+        #             print(layer.lmbda, end="\t")
+        #         print("")
         if is_eval_epoch(cur_epoch):
             for i in range(1, num_splits):
                 eval_epoch(loggers[i], loaders[i], model,

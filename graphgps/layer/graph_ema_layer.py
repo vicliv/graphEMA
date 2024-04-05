@@ -4,8 +4,56 @@ import torch.nn.functional as F
 import torch_geometric.nn as pyg_nn
 from torch_scatter import scatter
 from torch_geometric.utils import coalesce
+import math
 
+class ApplyLambda(nn.Module):
+    def __init__(self, D: int = 300, dt_max: float = 0.1, dt_min: float = 0.001):
+        super(ApplyLambda, self).__init__()  # Corrected to use the correct class name
+        
+        # Initialize parameters of the discretization
+        log_dt = (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        
+        log_lambda_real = torch.log(0.5 * torch.ones(D // 2))
+        lambda_imag = torch.arange(D // 2) * math.pi
+        
+        self.register_parameter("log_dt", nn.Parameter(torch.tensor(log_dt)))
+        self.register_parameter("log_lambda_real", nn.Parameter(log_lambda_real))
+        self.register_parameter("lambda_imag", nn.Parameter(lambda_imag))
 
+    def forward(self, x: torch.Tensor, one_minus=False):  # Corrected type hint
+        dt = torch.exp(self.log_dt)
+        lambda_complex = torch.exp((-torch.exp(self.log_lambda_real) + 1j * self.lambda_imag) * dt)
+        
+        # Get magnitude and phase directly
+        lambda_magnitude = 1 - torch.abs(lambda_complex) if one_minus else torch.abs(lambda_complex)
+        lambda_phase = torch.angle(lambda_complex)
+        
+        # Assuming x is [N, D], reshape it to work with complex pairs
+        x_pairs = x.reshape(*x.shape[:-1], -1, 2)
+        
+        # Apply rotation and scaling
+        x_rotated_real = (torch.cos(lambda_phase) * x_pairs[..., 0] - torch.sin(lambda_phase) * x_pairs[..., 1]) * lambda_magnitude
+        x_rotated_imag = (torch.sin(lambda_phase) * x_pairs[..., 0] + torch.cos(lambda_phase) * x_pairs[..., 1]) * lambda_magnitude
+        
+        # Combine real and imaginary parts back to a tensor of the original shape
+        x_transformed = torch.stack((x_rotated_real, x_rotated_imag), -1).view_as(x)
+        
+        return x_transformed
+
+class MLP(nn.Module):
+    def __init__(self, dim_in, dim_out) -> None:
+        super().__init__()
+        hidden_dim = (dim_in + dim_out)
+
+        self.fc1 = nn.Linear(dim_in, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(dim_in, hidden_dim, bias=False)
+        self.proj = nn.Linear(hidden_dim, dim_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.silu(self.fc1(x)) * self.fc2(x)
+        x = self.proj(x)
+        return x
+    
 def assert_bidirectional(edge_index):
     # Asserts that the edge_index is bidirectional
     # edge_index: (2, E)
@@ -86,28 +134,10 @@ def propagate(M, m, x, edge_index, deg, lmbda):
     assert_bidirectional(edge_index)
     E = edge_index.shape[1]
     M_ji = torch.cat((M[E // 2:], M[:E // 2]), dim=0)
-    epsilon = 1e-3
+
     M_updated = torch.where(deg_expanded == 1,
         x_expanded,
-        (1 - lmbda) * x_expanded + lmbda / (deg_expanded - 1 + 1e-9) * (m_expanded - M_ji))
-    # check nan values of M_updated, check if the indices match where deg_expanded ==1
-    #print(M_updated)
-    if torch.any(torch.isnan(M_updated)):
-        print(x)
-        print(x_expanded)
-        print(M_updated)
-        print(lmbda)
-        print(1-lmbda)
-        print((1 - lmbda) * x_expanded)
-        print((deg_expanded - 1) * (m_expanded - M_ji))
-        print("nan values in M_updated")
-        print(torch.where(torch.isnan(M_updated[:, 0])))
-        print("indices where deg_expanded == 1")
-        print(torch.where(deg_expanded == 1))
-        # print indices where M_updated is the same as x_expanded
-        print("indices where M_updated is the same as x_expanded")
-        print(torch.where(M_updated == x_expanded))
-        #xit()
+        lmbda(x_expanded, True) + lmbda(m_expanded - M_ji) / (deg_expanded - 1 + 1e-9))
     return M_updated
 
 
@@ -121,7 +151,8 @@ def ema(x, edge_index, lmbda, T):
     assert edge_index.shape[0] == 2
 
     E = edge_index.shape[1]
-    deg = scatter(src=torch.ones(E, device=x.device), index=edge_index[0], dim=0, reduce='sum')
+    deg = scatter(src=torch.ones(E, device=x.device), index=edge_index[0], dim=0, reduce='sum') 
+    
     M = expand(x, edge_index)
     m = aggregate(M, edge_index)
     if x.shape[0] != m.shape[0]:
@@ -134,8 +165,7 @@ def ema(x, edge_index, lmbda, T):
         if x.shape[0] != m.shape[0]:
             # add zeros to last row of m
             m = torch.cat((m, torch.zeros(x.shape[0] - m.shape[0], m.shape[1], device=m.device)), dim=0)
-    ou = torch.where(deg[..., None] == 0, x, (1 - lmbda) * x + lmbda / (deg[..., None]+1e-9) * m)
-    return ou
+    return torch.where(deg[..., None] == 0, x, lmbda(x, True) + lmbda(m) / (deg[..., None]+1e-9))
 
 
 class GraphEMALayer(nn.Module):
@@ -145,20 +175,22 @@ class GraphEMALayer(nn.Module):
         self.dim_out = dim_out
         self.dropout = dropout
         self.residual = residual
-        self.lmbda = nn.Parameter(torch.tensor(lmbda)) # NOTE: This could be made into a learnable parameter
+        #self.lmbda = nn.Parameter(torch.ones(dim_in) * lmbda) # NOTE: This could be made into a learnable parameter
         #self.lmbda = lmbda
+        self.lmbda = ApplyLambda(D=dim_in)
         self.T = T
-        self.model = pyg_nn.Linear(dim_in, dim_out)
+        self.model = MLP(dim_in, dim_out)
+        #self.lin = pyg_nn.Linear(dim_in, dim_out)
 
     def forward(self, batch):
         x = batch.x
         if self.dim_in == self.dim_out:
             x_in = x.clone()
         x = self.model(x)
+        #x = self.lin(x)
         if self.dim_in != self.dim_out:
             x_in = x.clone()
         x = ema(x, batch.edge_index, self.lmbda, self.T)
-        # check if x has nan values
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         if self.residual:
